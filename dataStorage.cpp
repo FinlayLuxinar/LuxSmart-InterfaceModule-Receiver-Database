@@ -71,31 +71,130 @@ void DataStorage::handleTimestamp(const std::unordered_map<std::string, msgpack:
     }
 }
 
+void DataStorage::createTableIfNotExists() {
+    // Ensure tableName is properly set
+    if (tableName.empty()) {
+        std::cerr << "Error: Table name is empty. Cannot create table." << std::endl;
+        throw std::runtime_error("Table name is not defined.");
+    }
+
+    // Prepare create table query
+    std::stringstream createTableQuery;
+    createTableQuery << "CREATE TABLE IF NOT EXISTS `" << tableName << "` ("
+                 << "flowRate SMALLINT UNSIGNED NOT NULL, "
+                 << "version CHAR(20) NOT NULL, "
+                 << "powerReading MEDIUMINT UNSIGNED NOT NULL, "
+                 << "frequency MEDIUMINT UNSIGNED NOT NULL, "
+                 << "pulseWidth MEDIUMINT UNSIGNED NOT NULL, "
+                 << "dcVoltage SMALLINT UNSIGNED NOT NULL, "
+                 << "dcCurrent SMALLINT UNSIGNED NOT NULL, "
+                 << "channelAForwardVoltage SMALLINT UNSIGNED NOT NULL, "
+                 << "channelAReferenceVoltage TINYINT UNSIGNED NOT NULL, "
+                 << "channelBForwardVoltage TINYINT UNSIGNED NOT NULL, "
+                 << "channelBReferenceVoltage TINYINT UNSIGNED NOT NULL, "
+                 << "channelCForwardVoltage TINYINT UNSIGNED NOT NULL, "
+                 << "channelCReferenceVoltage TINYINT UNSIGNED NOT NULL, "
+                 << "channelDForwardVoltage SMALLINT UNSIGNED NOT NULL, "
+                 << "channelDReferenceVoltage TINYINT UNSIGNED NOT NULL, "
+                 << "serialNumber TINYINT UNSIGNED NOT NULL, "
+                 << "systemType TINYINT UNSIGNED NOT NULL, "
+                 << "duty TINYINT UNSIGNED NOT NULL, "
+                 << "tubePressure TINYINT UNSIGNED NOT NULL, "
+                 << "wavelength TINYINT UNSIGNED NOT NULL, "
+                 << "timestamp DATETIME NOT NULL PRIMARY KEY"  // Set timestamp as PRIMARY KEY
+                 << ") PARTITION BY RANGE (TO_SECONDS(timestamp)) ("
+                 << " PARTITION p0 VALUES LESS THAN (TO_SECONDS('2024-01-01 00:00:00'))"
+                 << ");";
+
+    std::string queryStr = createTableQuery.str();
+
+    // Debug: Print the query
+    std::cout << "Generated Query: " << queryStr << std::endl;
+
+    // Execute query
+    if (mysql_query(conn, queryStr.c_str())) {
+        std::cerr << "Table creation failed: " << mysql_error(conn) << std::endl;
+        throw std::runtime_error("Could not create table");
+    }
+}
+
+
+void DataStorage::addPartitionsForNextHour() {
+    // Get current time
+    std::time_t now = std::time(nullptr);
+    std::tm* currentTime = std::localtime(&now);
+
+    // Prepare ALTER TABLE query
+    std::stringstream alterTableQuery;
+    alterTableQuery << "ALTER TABLE `laser_data` ADD PARTITION (";
+
+    for (int minute = 0; minute < 60; ++minute) {
+        std::tm partitionTime = *currentTime;
+        partitionTime.tm_min += minute;  // Add minutes incrementally
+        mktime(&partitionTime);          // Normalize the time structure
+
+        // Format the partition name and range
+        alterTableQuery << "PARTITION p"
+                        << partitionTime.tm_hour
+                        << std::setw(2) << std::setfill('0') << partitionTime.tm_min
+                        << " VALUES LESS THAN (TO_SECONDS('"
+                        << (partitionTime.tm_year + 1900) << "-"
+                        << std::setw(2) << std::setfill('0') << (partitionTime.tm_mon + 1) << "-"
+                        << std::setw(2) << std::setfill('0') << partitionTime.tm_mday << " "
+                        << std::setw(2) << std::setfill('0') << partitionTime.tm_hour << ":"
+                        << std::setw(2) << std::setfill('0') << partitionTime.tm_min << ":00'))";
+        if (minute < 59) {
+            alterTableQuery << ", ";
+        }
+    }
+    alterTableQuery << ");";
+
+    // Execute the ALTER TABLE query
+    std::string queryStr = alterTableQuery.str();
+    std::cout << "Generated Query: " << queryStr << std::endl;
+
+    if (mysql_query(conn, queryStr.c_str())) {
+        std::cerr << "Failed to add partitions: " << mysql_error(conn) << std::endl;
+    } else {
+        std::cout << "Partitions for the next hour added successfully." << std::endl;
+    }
+}
+
+
+
+
 void DataStorage::insertAllData() {
-    std::stringstream queryStream;
-    queryStream << "INSERT INTO data (flowRate, version, powerReading, frequency, pulseWidth, dcVoltage, dcCurrent, channelAForwardVoltage, channelAReferenceVoltage, channelBForwardVoltage, channelBReferenceVoltage, channelCForwardVoltage, channelCReferenceVoltage, channelDForwardVoltage, channelDReferenceVoltage, serialNumber, systemType, duty, tubePressure, waveLength, timestamp) VALUES (";
+    // Ensure table exists before inserting
+    createTableIfNotExists();
+    // Check and create monthly partition if needed
+    addPartitionsForNextHour();
+
     
-    queryStream << laserheadFlow.flowRate << ", "           // flow rate
-                << "'" << version.version << "', "          // Properly quoted string
-                << power.powerReading << ", "               // power reading
-                << pwmModulation.frequency << ", "          // frequency
-                << pwmModulation.pulseWidth << ", "         // pulse width
-                << dcInfo.dcVoltage << ", "                 // DC voltage
-                << dcInfo.dcCurrent << ", "                 // DC current
-                << rfInfo.channelAForwardVoltage << ", "    // Channel A forward voltage
-                << rfInfo.channelAReferenceVoltage << ", "  // Channel A reference voltage
-                << rfInfo.channelBForwardVoltage << ", "    // Channel B forward voltage
-                << rfInfo.channelBReferenceVoltage << ", "  // Channel B reference voltage
-                << rfInfo.channelCForwardVoltage << ", "    // Channel C forward voltage
-                << rfInfo.channelCReferenceVoltage << ", "  // Channel C reference voltage
-                << rfInfo.channelDForwardVoltage << ", "    // Channel D forward voltage
-                << rfInfo.channelDReferenceVoltage << ", "  // Channel D reference voltage
-                << systemInfo.serialNumber << ", "          // serial number
-                << systemInfo.systemType << ", "            // system type
-                << systemInfo.duty << ", "                  // duty
-                << systemInfo.tubePressure << ", "          // tube pressure
-                << systemInfo.wavelength << ", "            // wavelength
-                << "'" << timestamp.formatted << "')";      // Enclosed in single quotes
+
+    std::stringstream queryStream;
+    queryStream << "INSERT INTO `" << tableName << "` (flowRate, version, powerReading, frequency, pulseWidth, dcVoltage, dcCurrent, channelAForwardVoltage, channelAReferenceVoltage, channelBForwardVoltage, channelBReferenceVoltage, channelCForwardVoltage, channelCReferenceVoltage, channelDForwardVoltage, channelDReferenceVoltage, serialNumber, systemType, duty, tubePressure, wavelength, timestamp) VALUES (";
+    
+    queryStream << laserheadFlow.flowRate << ", "           // flow rate (SMALLINT UNSIGNED)
+                << "'" << version.version << "', "          // Fixed-length version string
+                << power.powerReading << ", "               // power reading (MEDIUMINT UNSIGNED)
+                << pwmModulation.frequency << ", "          // frequency (MEDIUMINT UNSIGNED)
+                << pwmModulation.pulseWidth << ", "         // pulse width (MEDIUMINT UNSIGNED)
+                << dcInfo.dcVoltage << ", "                 // DC voltage (SMALLINT UNSIGNED)
+                << dcInfo.dcCurrent << ", "                 // DC current (SMALLINT UNSIGNED)
+                << rfInfo.channelAForwardVoltage << ", "    // Channel A forward voltage (SMALLINT UNSIGNED)
+                << rfInfo.channelAReferenceVoltage << ", "  // Channel A reference voltage (TINYINT UNSIGNED)
+                << rfInfo.channelBForwardVoltage << ", "    // Channel B forward voltage (TINYINT UNSIGNED)
+                << rfInfo.channelBReferenceVoltage << ", "  // Channel B reference voltage (TINYINT UNSIGNED)
+                << rfInfo.channelCForwardVoltage << ", "    // Channel C forward voltage (TINYINT UNSIGNED)
+                << rfInfo.channelCReferenceVoltage << ", "  // Channel C reference voltage (TINYINT UNSIGNED)
+                << rfInfo.channelDForwardVoltage << ", "    // Channel D forward voltage (TINYINT UNSIGNED)
+                << rfInfo.channelDReferenceVoltage << ", "  // Channel D reference voltage (TINYINT UNSIGNED)
+                << systemInfo.serialNumber << ", "          // serial number (TINYINT UNSIGNED)
+                << systemInfo.systemType << ", "            // system type (TINYINT UNSIGNED)
+                << systemInfo.duty << ", "                  // duty (TINYINT UNSIGNED)
+                << systemInfo.tubePressure << ", "          // tube pressure (TINYINT UNSIGNED)
+                << systemInfo.wavelength << ", "            // wavelength (TINYINT UNSIGNED)
+                << "'" << timestamp.formatted << "')";      // Timestamp with millisecond precision
 
     std::string query = queryStream.str();
 

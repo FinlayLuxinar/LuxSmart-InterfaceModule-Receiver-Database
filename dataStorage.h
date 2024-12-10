@@ -60,7 +60,7 @@ struct Timestamp {
 };
 
 
-
+    std::string tableName = "laser_data";
     LaserheadFlow laserheadFlow;
     Version version;
     Power power;
@@ -81,6 +81,8 @@ struct Timestamp {
     void handleTimestamp(const std::unordered_map<std::string, msgpack::object>& dataMap);
 
     void insertAllData();
+    void createTableIfNotExists();
+    void addPartitionsForNextHour();
 
     // Database connection
     MYSQL* conn;
