@@ -38,9 +38,6 @@ void DataStorage::handleTimestamp(const std::unordered_map<std::string, msgpack:
 
         // Attempt to extract timestamp
         uint64_t receivedTimestamp = dataMap.at("timestamp").as<uint64_t>();
-        
-        // Debug print
-        std::cout << "Received Raw Timestamp: " << receivedTimestamp << std::endl;
 
         // Validate timestamp (optional, but can catch some edge cases)
         if (receivedTimestamp == 0) {
@@ -63,7 +60,6 @@ void DataStorage::handleTimestamp(const std::unordered_map<std::string, msgpack:
 
         // Store the formatted timestamp
         timestamp.formatted = timestampStream.str();
-        std::cout << "Formatted Timestamp: " << timestamp.formatted << std::endl;
     } 
     catch (const std::exception& e) {
         std::cerr << "Timestamp handling error: " << e.what() << std::endl;
@@ -71,140 +67,185 @@ void DataStorage::handleTimestamp(const std::unordered_map<std::string, msgpack:
     }
 }
 
-void DataStorage::createTableIfNotExists() {
-    // Ensure tableName is properly set
-    if (tableName.empty()) {
-        std::cerr << "Error: Table name is empty. Cannot create table." << std::endl;
-        throw std::runtime_error("Table name is not defined.");
-    }
-
-    // Prepare create table query
-    std::stringstream createTableQuery;
-    createTableQuery << "CREATE TABLE IF NOT EXISTS `" << tableName << "` ("
-                 << "flowRate SMALLINT UNSIGNED NOT NULL, "
-                 << "version CHAR(20) NOT NULL, "
-                 << "powerReading MEDIUMINT UNSIGNED NOT NULL, "
-                 << "frequency MEDIUMINT UNSIGNED NOT NULL, "
-                 << "pulseWidth MEDIUMINT UNSIGNED NOT NULL, "
-                 << "dcVoltage SMALLINT UNSIGNED NOT NULL, "
-                 << "dcCurrent SMALLINT UNSIGNED NOT NULL, "
-                 << "channelAForwardVoltage SMALLINT UNSIGNED NOT NULL, "
-                 << "channelAReferenceVoltage TINYINT UNSIGNED NOT NULL, "
-                 << "channelBForwardVoltage TINYINT UNSIGNED NOT NULL, "
-                 << "channelBReferenceVoltage TINYINT UNSIGNED NOT NULL, "
-                 << "channelCForwardVoltage TINYINT UNSIGNED NOT NULL, "
-                 << "channelCReferenceVoltage TINYINT UNSIGNED NOT NULL, "
-                 << "channelDForwardVoltage SMALLINT UNSIGNED NOT NULL, "
-                 << "channelDReferenceVoltage TINYINT UNSIGNED NOT NULL, "
-                 << "serialNumber TINYINT UNSIGNED NOT NULL, "
-                 << "systemType TINYINT UNSIGNED NOT NULL, "
-                 << "duty TINYINT UNSIGNED NOT NULL, "
-                 << "tubePressure TINYINT UNSIGNED NOT NULL, "
-                 << "wavelength TINYINT UNSIGNED NOT NULL, "
-                 << "timestamp DATETIME NOT NULL PRIMARY KEY"  // Set timestamp as PRIMARY KEY
-                 << ") PARTITION BY RANGE (TO_SECONDS(timestamp)) ("
-                 << " PARTITION p0 VALUES LESS THAN (TO_SECONDS('2024-01-01 00:00:00'))"
-                 << ");";
-
-    std::string queryStr = createTableQuery.str();
-
-    // Debug: Print the query
-    std::cout << "Generated Query: " << queryStr << std::endl;
-
-    // Execute query
-    if (mysql_query(conn, queryStr.c_str())) {
-        std::cerr << "Table creation failed: " << mysql_error(conn) << std::endl;
-        throw std::runtime_error("Could not create table");
-    }
-}
-
-
-void DataStorage::addPartitionsForNextHour() {
+void createMonthlyPartitions(MYSQL* conn) {
     // Get current time
     std::time_t now = std::time(nullptr);
     std::tm* currentTime = std::localtime(&now);
+    
+    // Determine days in current month
+    int daysInMonth = [](int year, int month) {
+        static const int days[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+        return (month == 1 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0))) ? 29 : days[month];
+    }(currentTime->tm_year + 1900, currentTime->tm_mon);
 
-    // Prepare ALTER TABLE query
-    std::stringstream alterTableQuery;
-    alterTableQuery << "ALTER TABLE `laser_data` ADD PARTITION (";
+    // Existing partitions tracking
+    std::map<std::string, long long> existingPartitions;
+    std::string checkQuery = 
+        "SELECT partition_name, CAST(partition_description AS SIGNED) as part_desc FROM information_schema.partitions "
+        "WHERE table_schema = DATABASE() AND table_name = 'laser_data' "
+        "ORDER BY part_desc";
 
-    for (int minute = 0; minute < 60; ++minute) {
-        std::tm partitionTime = *currentTime;
-        partitionTime.tm_min += minute;  // Add minutes incrementally
-        mktime(&partitionTime);          // Normalize the time structure
-
-        // Format the partition name and range
-        alterTableQuery << "PARTITION p"
-                        << partitionTime.tm_hour
-                        << std::setw(2) << std::setfill('0') << partitionTime.tm_min
-                        << " VALUES LESS THAN (TO_SECONDS('"
-                        << (partitionTime.tm_year + 1900) << "-"
-                        << std::setw(2) << std::setfill('0') << (partitionTime.tm_mon + 1) << "-"
-                        << std::setw(2) << std::setfill('0') << partitionTime.tm_mday << " "
-                        << std::setw(2) << std::setfill('0') << partitionTime.tm_hour << ":"
-                        << std::setw(2) << std::setfill('0') << partitionTime.tm_min << ":00'))";
-        if (minute < 59) {
-            alterTableQuery << ", ";
-        }
+    if (mysql_query(conn, checkQuery.c_str())) {
+        std::cerr << "Failed to check partitions: " << mysql_error(conn) << std::endl;
+        return;
     }
-    alterTableQuery << ");";
 
-    // Execute the ALTER TABLE query
-    std::string queryStr = alterTableQuery.str();
+    MYSQL_RES* result = mysql_store_result(conn);
+    if (!result) {
+        std::cerr << "Failed to retrieve partitions: " << mysql_error(conn) << std::endl;
+        return;
+    }
+
+    long long lastPartitionValue = 0;
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(result))) {
+        std::string partitionName(row[0]);
+        long long partitionValue = row[1] ? std::stoll(row[1]) : 0;
+        existingPartitions[partitionName] = partitionValue;
+        lastPartitionValue = std::max(lastPartitionValue, partitionValue);
+    }
+    mysql_free_result(result);
+
+    // Prepare partition creation query
+    std::stringstream partitionQuery;
+    partitionQuery << "ALTER TABLE laser_data ADD PARTITION (";
+
+    bool firstPartition = true;
+    bool partitionNeedsAdding = false;
+
+    // Create partitions for remaining days
+    for (int day = currentTime->tm_mday; day <= daysInMonth; ++day) {
+        // Construct partition time
+        std::tm partitionTime = *currentTime;
+        partitionTime.tm_mday = day;
+        partitionTime.tm_hour = 0;
+        partitionTime.tm_min = 0;
+        partitionTime.tm_sec = 0;
+        std::mktime(&partitionTime);
+
+        // Generate partition name (PYYYYMMDD)
+        char partitionName[20];
+        std::snprintf(partitionName, sizeof(partitionName), 
+            "P%d%02d%02d", 
+            partitionTime.tm_year + 1900, 
+            partitionTime.tm_mon + 1, 
+            partitionTime.tm_mday);
+
+        // Skip existing partitions
+        if (existingPartitions.count(partitionName) > 0) {
+            std::cout << "Partition " << partitionName << " already exists. Skipping." << std::endl;
+            continue;
+        }
+
+        // Format date for VALUES LESS THAN ('YYYY-MM-DD 00:00:00')
+        char dateBuffer[80];
+        std::strftime(dateBuffer, sizeof(dateBuffer), "%Y-%m-%d 00:00:00", &partitionTime);
+
+        // Add to partition query in the correct format
+        if (!firstPartition) {
+            partitionQuery << ", ";
+        }
+        partitionQuery << "PARTITION " << partitionName 
+                       << " VALUES LESS THAN ('" << dateBuffer << "')";
+
+        firstPartition = false;
+        partitionNeedsAdding = true;
+    }
+
+    partitionQuery << ");";
+
+    // Execute partition creation if needed
+    if (!partitionNeedsAdding) {
+        std::cout << "No new partitions to add." << std::endl;
+        return;
+    }
+
+    std::string queryStr = partitionQuery.str();
     std::cout << "Generated Query: " << queryStr << std::endl;
 
     if (mysql_query(conn, queryStr.c_str())) {
         std::cerr << "Failed to add partitions: " << mysql_error(conn) << std::endl;
     } else {
-        std::cout << "Partitions for the next hour added successfully." << std::endl;
+        std::cout << "Partitions added successfully." << std::endl;
     }
 }
 
 
+std::string DataStorage::getCurrentPartitionName() {
+    // Get current time
+    std::time_t now = std::time(nullptr);
+    std::tm* currentTime = std::localtime(&now);
 
+    // Format partition name as pYYYYMMDD
+    char partitionName[20];
+    std::snprintf(partitionName, sizeof(partitionName), 
+        "p%d%02d%02d", 
+        currentTime->tm_year + 1900,  // Years since 1900 
+        currentTime->tm_mon + 1,      // Months are 0-11, so add 1 
+        currentTime->tm_mday);        // Day of the month
 
+    return std::string(partitionName);
+}
+
+// Function to insert all data into the database
 void DataStorage::insertAllData() {
-    // Ensure table exists before inserting
-    createTableIfNotExists();
+
     // Check and create monthly partition if needed
-    addPartitionsForNextHour();
+    createMonthlyPartitions(conn);
 
     
+
+   std::string currentPartition = getCurrentPartitionName();
 
     std::stringstream queryStream;
-    queryStream << "INSERT INTO `" << tableName << "` (flowRate, version, powerReading, frequency, pulseWidth, dcVoltage, dcCurrent, channelAForwardVoltage, channelAReferenceVoltage, channelBForwardVoltage, channelBReferenceVoltage, channelCForwardVoltage, channelCReferenceVoltage, channelDForwardVoltage, channelDReferenceVoltage, serialNumber, systemType, duty, tubePressure, wavelength, timestamp) VALUES (";
+    queryStream << "INSERT INTO `" << tableName << "` ("
+            << "flowRate, version, powerReading, frequency, pulseWidth, "
+            << "dcVoltage, dcCurrent, channelAForwardVoltage, channelAReferenceVoltage, "
+            << "channelBForwardVoltage, channelBReferenceVoltage, "
+            << "channelCForwardVoltage, channelCReferenceVoltage, "
+            << "channelDForwardVoltage, channelDReferenceVoltage, "
+            << "serialNumber, systemType, duty, tubePressure, wavelength, "
+            << "timestamp) VALUES (";
+
     
-    queryStream << laserheadFlow.flowRate << ", "           // flow rate (SMALLINT UNSIGNED)
-                << "'" << version.version << "', "          // Fixed-length version string
-                << power.powerReading << ", "               // power reading (MEDIUMINT UNSIGNED)
-                << pwmModulation.frequency << ", "          // frequency (MEDIUMINT UNSIGNED)
-                << pwmModulation.pulseWidth << ", "         // pulse width (MEDIUMINT UNSIGNED)
-                << dcInfo.dcVoltage << ", "                 // DC voltage (SMALLINT UNSIGNED)
-                << dcInfo.dcCurrent << ", "                 // DC current (SMALLINT UNSIGNED)
-                << rfInfo.channelAForwardVoltage << ", "    // Channel A forward voltage (SMALLINT UNSIGNED)
-                << rfInfo.channelAReferenceVoltage << ", "  // Channel A reference voltage (TINYINT UNSIGNED)
-                << rfInfo.channelBForwardVoltage << ", "    // Channel B forward voltage (TINYINT UNSIGNED)
-                << rfInfo.channelBReferenceVoltage << ", "  // Channel B reference voltage (TINYINT UNSIGNED)
-                << rfInfo.channelCForwardVoltage << ", "    // Channel C forward voltage (TINYINT UNSIGNED)
-                << rfInfo.channelCReferenceVoltage << ", "  // Channel C reference voltage (TINYINT UNSIGNED)
-                << rfInfo.channelDForwardVoltage << ", "    // Channel D forward voltage (TINYINT UNSIGNED)
-                << rfInfo.channelDReferenceVoltage << ", "  // Channel D reference voltage (TINYINT UNSIGNED)
-                << systemInfo.serialNumber << ", "          // serial number (TINYINT UNSIGNED)
-                << systemInfo.systemType << ", "            // system type (TINYINT UNSIGNED)
-                << systemInfo.duty << ", "                  // duty (TINYINT UNSIGNED)
-                << systemInfo.tubePressure << ", "          // tube pressure (TINYINT UNSIGNED)
-                << systemInfo.wavelength << ", "            // wavelength (TINYINT UNSIGNED)
-                << "'" << timestamp.formatted << "')";      // Timestamp with millisecond precision
+    queryStream << laserheadFlow.flowRate << ", " 
+                << "'" << version.version << "', "        
+                << power.powerReading << ", "               
+                << pwmModulation.frequency << ", "          
+                << pwmModulation.pulseWidth << ", "         
+                << dcInfo.dcVoltage << ", "                 
+                << dcInfo.dcCurrent << ", "                 
+                << rfInfo.channelAForwardVoltage << ", "    
+                << rfInfo.channelAReferenceVoltage << ", "  
+                << rfInfo.channelBForwardVoltage << ", "    
+                << rfInfo.channelBReferenceVoltage << ", "  
+                << rfInfo.channelCForwardVoltage << ", "    
+                << rfInfo.channelCReferenceVoltage << ", "  
+                << rfInfo.channelDForwardVoltage << ", "    
+                << rfInfo.channelDReferenceVoltage << ", "  
+                << systemInfo.serialNumber << ", "          
+                << systemInfo.systemType << ", "            
+                << systemInfo.duty << ", "                  
+                << systemInfo.tubePressure << ", "          
+                << systemInfo.wavelength << ", "            
+                << "'" << timestamp.formatted << "')";      
 
     std::string query = queryStream.str();
 
     std::cout << "Generated Query: " << query << std::endl;
     
     if (mysql_query(conn, query.c_str())) {
-        std::cerr << "INSERT failed: " << mysql_error(conn) << std::endl;
-        std::cerr << "Query: " << query << std::endl;
+        std::cerr << "INSERT failed: " << mysql_error(conn) 
+                  << "\nQuery: " << query << std::endl;
+        
+        // Additional diagnostic information
+        std::cout << "Debug Info:" << std::endl;
+        std::cout << "Timestamp: " << timestamp.formatted << std::endl;
+        std::cout << "Partition: " << currentPartition << std::endl;
     }
 }
+
+
 
 void DataStorage::handleLaserheadFlow(const std::unordered_map<std::string, msgpack::object>& dataMap) {
     try {

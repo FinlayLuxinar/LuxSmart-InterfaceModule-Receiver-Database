@@ -81,12 +81,18 @@ struct Timestamp {
     void handleTimestamp(const std::unordered_map<std::string, msgpack::object>& dataMap);
 
     void insertAllData();
-    void createTableIfNotExists();
-    void addPartitionsForNextHour();
+    void checkAndCreateMonthlyPartitions();
+    std::string getCurrentPartitionName();
+
+    double GetMaxStorage();
+    
 
     // Database connection
     MYSQL* conn;
 };
+
+
+
 
 #endif // DATASTORAGE_H
     

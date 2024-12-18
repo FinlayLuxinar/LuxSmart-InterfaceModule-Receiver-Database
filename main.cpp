@@ -1,149 +1,68 @@
+#include <zmq.hpp>
+#include <msgpack.hpp>
 #include <iostream>
-#include <fstream>
-#include <sstream>
 #include <string>
-#include <vector>
-#include <mariadb/mysql.h>
-#include <filesystem>
-#include <algorithm>
+#include <unordered_map>
+#include <memory>
+#include <thread>
+#include <chrono>
+#include <ctime>
+#include <atomic>
 
-namespace fs = std::filesystem;
+#include "receiver.h"
+#include "dataStorage.h"
+#include "storageManager.h"
 
-void executeQuery(MYSQL *conn, const std::string& query, MYSQL_RES** result) {
-    if (mysql_query(conn, query.c_str())) {
-        std::cerr << "Error executing query: " << mysql_error(conn) << std::endl;
-        exit(1);
-    }
-    *result = mysql_store_result(conn);
+// Function to wait until the start of the next hour
+void waitUntilNextHour() {
+    auto now = std::chrono::system_clock::now();
+    auto nextHour = std::chrono::time_point_cast<std::chrono::minutes>(now) + std::chrono::minutes(1);
+    std::this_thread::sleep_until(nextHour);
 }
 
-std::pair<int, int> getOldestPartition(MYSQL *conn) {
-    // Query to get partition names
-    std::string query = "SELECT partition_name, partition_description "
-                        "FROM information_schema.partitions "
-                        "WHERE table_schema = 'my_database' AND table_name = 'data_partitioned' "
-                        "AND partition_method = 'RANGE'";
-    MYSQL_RES *result;
-    executeQuery(conn, query, &result);
+// Thread function to check disk usage
+void monitorDiskUsage(std::shared_ptr<StorageManager> storageManager, std::atomic<bool>& running, const std::string& outputFolder) {
+    while (running) {
+        // Wait until the next hour
+        waitUntilNextHour();
 
-    // Vector to hold (year, month) pairs
-    std::vector<std::pair<int, int>> partitionDates;
-
-    // Parse partition names
-    MYSQL_ROW row;
-    while ((row = mysql_fetch_row(result))) {
-        std::string partitionName = row[0];
-        std::string partitionDesc = row[1];
-
-        // Skip 'future' partition
-        if (partitionName == "future") continue;
-
-        // Extract year and month from partition name (assuming format like p202312)
-        if (partitionName.length() == 7 && partitionName[0] == 'p') {
-            int year = std::stoi(partitionName.substr(1, 4));
-            int month = std::stoi(partitionName.substr(5, 2));
-            partitionDates.push_back({year, month});
+        // Check disk usage
+        if (storageManager->checkDiskUsage()) {
+            std::cout << "Disk usage is full!" << std::endl;
+            // Trigger storage reduction by calling reduceStorage
+            storageManager->reduceStorage(outputFolder);  // For example, delete data older than 30 days
+        }
+        else {
+            std::cout << "Disk usage is below threshold." << std::endl;
         }
     }
-
-    mysql_free_result(result);
-
-    // Find the oldest (earliest) date
-    if (partitionDates.empty()) {
-        std::cerr << "No partitions found." << std::endl;
-        exit(1);
-    }
-
-    auto oldest = partitionDates[0];
-    for (const auto& date : partitionDates) {
-        if (date.first < oldest.first || (date.first == oldest.first && date.second < oldest.second)) {
-            oldest = date;
-        }
-    }
-
-    return oldest;
 }
 
-void dumpPartitionToCSV(MYSQL *conn, const std::pair<int, int>& partition) {
-    // Create a unique folder for the current month
-    std::string monthStr = (partition.second < 10 ? "0" : "") + 
-                            std::to_string(partition.second) + "_" + 
-                            std::to_string(partition.first % 100);
-    std::string folderName = "data_" + monthStr;
-    fs::create_directory(folderName);
 
-    // Prepare CSV export query for this partition
-    std::stringstream exportQuery;
-    exportQuery << "SELECT * FROM data PARTITION(p" 
-                << partition.first 
-                << std::setw(2) << std::setfill('0') 
-                << partition.second 
-                << ") INTO OUTFILE '" 
-                << folderName << "/partition_data.csv' "
-                << "FIELDS TERMINATED BY ',' "
-                << "ENCLOSED BY '\"' "
-                << "LINES TERMINATED BY '\\n'";
+int main() {
+    // Create shared pointer for StorageManager
+    auto storageManager = std::make_shared<StorageManager>("localhost", "my_user", "my_password", "my_database");
+    auto storage = std::make_shared<DataStorage>();
 
-    // Export data
-    if (mysql_query(conn, exportQuery.str().c_str())) {
-        std::cerr << "Error exporting partition: " << mysql_error(conn) << std::endl;
-        exit(1);
+    // Atomic flag to manage the lifetime of the thread
+    std::atomic<bool> running(true);
+
+    // Specify the folder where CSV files should be exported
+    std::string outputFolder = "/home/raspberry/database";
+
+    // Start the disk usage monitor thread
+    std::thread diskMonitorThread(monitorDiskUsage, storageManager, std::ref(running), outputFolder);
+
+    // Create receiver with shared resources
+    Receiver receiver(storage);
+    receiver.receiveData();
+
+    // Join the thread (optional if you need clean termination, or handle stopping it)
+    running = false;
+    if (diskMonitorThread.joinable()) {
+        diskMonitorThread.join();
     }
-
-    // Drop the partition
-    std::stringstream dropQuery;
-    dropQuery << "ALTER TABLE data DROP PARTITION p" 
-              << partition.first 
-              << std::setw(2) << std::setfill('0') 
-              << partition.second;
-
-    if (mysql_query(conn, dropQuery.str().c_str())) {
-        std::cerr << "Error dropping partition: " << mysql_error(conn) << std::endl;
-        exit(1);
-    }
-
-    std::cout << "Exported and dropped partition for " 
-              << partition.second << "/" << partition.first << std::endl;
-}
-
-void deletePartitions(MYSQL *conn, int partitionsToDelete) {
-    // Delete the specified number of partitions
-    for (int i = 0; i < partitionsToDelete; ++i) {
-        // Get oldest partition
-        auto oldest = getOldestPartition(conn);
-        
-        // Dump and drop partition
-        dumpPartitionToCSV(conn, oldest);
-    }
-
-    std::cout << "Completed deletion of " << partitionsToDelete << " partitions." << std::endl;
-}
-
-int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::cerr << "Usage: sudo ./main <partitions_to_delete>" << std::endl;
-        exit(1);
-    }
-
-    int partitionsToDelete = std::stoi(argv[1]);
-    if (partitionsToDelete <= 0) {
-        std::cerr << "Number of partitions to delete must be greater than 0." << std::endl;
-        exit(1);
-    }
-
-    MYSQL *conn;
-    conn = mysql_init(nullptr);
-
-    // Connect to MariaDB
-    if (!mysql_real_connect(conn, "localhost", "my_user", "my_password", "my_database", 0, nullptr, 0)) {
-        std::cerr << "Error connecting to database: " << mysql_error(conn) << std::endl;
-        exit(1);
-    }
-
-    // Delete the specified number of partitions
-    deletePartitions(conn, partitionsToDelete);
-
-    mysql_close(conn);
 
     return 0;
 }
+

@@ -11,6 +11,7 @@ set(SOURCES
     main.cpp
     dataStorage.cpp
     receiver.cpp
+    storageManager.cpp
 )
 
 # Add the executable target
